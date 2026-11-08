@@ -34,10 +34,11 @@ frontend/build/
 .next/
 *.tsbuildinfo
 
-# Medical imaging data - never commit
-dataset/
-*.nii
-*.nii.gz
+# Medical imaging data
+dataset/*
+!dataset/brain/
+dataset/brain/normal/Normal_Brain_Datasets
+dataset/brain/tumor/Pathological_Brain_Datasets
 *.dcm
 *.dicom
 *.mha
@@ -46,12 +47,9 @@ dataset/
 *.nrrd
 
 # Model weights
-weights/*.pth
-weights/*.pt
-weights/*.onnx
-weights/*.bin
-weights/*.h5
-*.ckpt
+weights/*
+!weights/BrainTumorSegmentationModel.pt
+!weights/best_unet_wt_tc_et.pth
 
 # Outputs
 outputs/
