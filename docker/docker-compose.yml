@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.backend
+    ports:
+      - "8000:8000"
+    environment:
+      - NEUROFUSION_APP_HOST=0.0.0.0
+      - NEUROFUSION_APP_PORT=8000
+    volumes:
+      - ../outputs:/app/outputs
+      - ../weights:/app/weights
+      - ../dataset:/app/dataset
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend

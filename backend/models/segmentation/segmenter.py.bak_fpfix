@@ -1,0 +1,533 @@
+"""
+NeuroFusion AI - Module 5: ROI Segmentation Models
+Implementations of 2D/3D UNet, UNet++, Attention UNet, 3D UNet, and SwinUNETR wrappers.
+"""
+
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from loguru import logger
+
+
+class DoubleConv(nn.Module):
+    """(Convolution => [BN] => ReLU) * 2"""
+
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.double_conv(x)
+
+
+class UNet(nn.Module):
+    """Standard 2D UNet for MRI Slice Segmentation."""
+
+    def __init__(self, in_channels: int = 1, out_channels: int = 4, features: list[int] = [64, 128, 256, 512]):
+        super().__init__()
+        self.downs = nn.ModuleList()
+        self.ups = nn.ModuleList()
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        # Down part
+        in_c = in_channels
+        for feature in features:
+            self.downs.append(DoubleConv(in_c, feature))
+            in_c = feature
+
+        # Up part
+        for feature in reversed(features):
+            self.ups.append(
+                nn.ConvTranspose2d(feature * 2, feature, kernel_size=2, stride=2)
+            )
+            self.ups.append(DoubleConv(feature * 2, feature))
+
+        self.bottleneck = DoubleConv(features[-1], features[-1] * 2)
+        self.final_conv = nn.Conv2d(features[0], out_channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        skip_connections = []
+
+        for down in self.downs:
+            x = down(x)
+            skip_connections.append(x)
+            x = self.pool(x)
+
+        x = self.bottleneck(x)
+        skip_connections = skip_connections[::-1]
+
+        for idx in range(0, len(self.ups), 2):
+            x = self.ups[idx](x)
+            skip_connection = skip_connections[idx // 2]
+
+            if x.shape != skip_connection.shape:
+                x = F.interpolate(x, size=skip_connection.shape[2:], mode="bilinear", align_corners=True)
+
+            concat_x = torch.cat((skip_connection, x), dim=1)
+            x = self.ups[idx + 1](concat_x)
+
+        return self.final_conv(x)
+
+
+class AttentionBlock(nn.Module):
+    """Attention Gate for Attention UNet."""
+
+    def __init__(self, F_g: int, F_l: int, F_int: int):
+        super().__init__()
+        self.W_g = nn.Sequential(
+            nn.Conv2d(F_g, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(F_int)
+        )
+        self.W_l = nn.Sequential(
+            nn.Conv2d(F_l, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(F_int)
+        )
+        self.psi = nn.Sequential(
+            nn.Conv2d(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(1),
+            nn.Sigmoid()
+        )
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, g: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        g1 = self.W_g(g)
+        x1 = self.W_l(x)
+        if g1.shape != x1.shape:
+            g1 = F.interpolate(g1, size=x1.shape[2:], mode="bilinear", align_corners=True)
+        net = self.relu(g1 + x1)
+        res = self.psi(net)
+        return x * res
+
+
+class AttentionUNet(nn.Module):
+    """Attention UNet Architecture."""
+
+    def __init__(self, in_channels: int = 1, out_channels: int = 4, features: list[int] = [64, 128, 256, 512]):
+        super().__init__()
+        self.downs = nn.ModuleList()
+        self.ups = nn.ModuleList()
+        self.attentions = nn.ModuleList()
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        in_c = in_channels
+        for feature in features:
+            self.downs.append(DoubleConv(in_c, feature))
+            in_c = feature
+
+        for feature in reversed(features):
+            self.ups.append(nn.ConvTranspose2d(feature * 2, feature, kernel_size=2, stride=2))
+            self.attentions.append(AttentionBlock(F_g=feature, F_l=feature, F_int=feature // 2))
+            self.ups.append(DoubleConv(feature * 2, feature))
+
+        self.bottleneck = DoubleConv(features[-1], features[-1] * 2)
+        self.final_conv = nn.Conv2d(features[0], out_channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        skip_connections = []
+        for down in self.downs:
+            x = down(x)
+            skip_connections.append(x)
+            x = self.pool(x)
+
+        x = self.bottleneck(x)
+        skip_connections = skip_connections[::-1]
+
+        att_idx = 0
+        for idx in range(0, len(self.ups), 2):
+            x = self.ups[idx](x)
+            skip = skip_connections[att_idx]
+            skip = self.attentions[att_idx](g=x, x=skip)
+            att_idx += 1
+
+            if x.shape != skip.shape:
+                x = F.interpolate(x, size=skip.shape[2:], mode="bilinear", align_corners=True)
+
+            x = torch.cat((skip, x), dim=1)
+            x = self.ups[idx + 1](x)
+
+        return self.final_conv(x)
+
+
+class UNetPlusPlus(nn.Module):
+    """UNet++ (Nested UNet Architecture)."""
+
+    def __init__(self, in_channels: int = 1, out_channels: int = 4, nb_filter: list[int] = [32, 64, 128, 256, 512]):
+        super().__init__()
+        self.pool = nn.MaxPool2d(2, 2)
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+
+        self.conv0_0 = DoubleConv(in_channels, nb_filter[0])
+        self.conv1_0 = DoubleConv(nb_filter[0], nb_filter[1])
+        self.conv2_0 = DoubleConv(nb_filter[1], nb_filter[2])
+        self.conv3_0 = DoubleConv(nb_filter[2], nb_filter[3])
+        self.conv4_0 = DoubleConv(nb_filter[3], nb_filter[4])
+
+        self.conv0_1 = DoubleConv(nb_filter[0] + nb_filter[1], nb_filter[0])
+        self.conv1_1 = DoubleConv(nb_filter[1] + nb_filter[2], nb_filter[1])
+        self.conv2_1 = DoubleConv(nb_filter[2] + nb_filter[3], nb_filter[2])
+        self.conv3_1 = DoubleConv(nb_filter[3] + nb_filter[4], nb_filter[3])
+
+        self.conv0_2 = DoubleConv(nb_filter[0] * 2 + nb_filter[1], nb_filter[0])
+        self.conv1_2 = DoubleConv(nb_filter[1] * 2 + nb_filter[2], nb_filter[1])
+        self.conv2_2 = DoubleConv(nb_filter[2] * 2 + nb_filter[3], nb_filter[2])
+
+        self.conv0_3 = DoubleConv(nb_filter[0] * 3 + nb_filter[1], nb_filter[0])
+        self.conv1_3 = DoubleConv(nb_filter[1] * 3 + nb_filter[2], nb_filter[1])
+
+        self.conv0_4 = DoubleConv(nb_filter[0] * 4 + nb_filter[1], nb_filter[0])
+        self.final = nn.Conv2d(nb_filter[0], out_channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x0_0 = self.conv0_0(x)
+        x1_0 = self.conv1_0(self.pool(x0_0))
+        x0_1 = self.conv0_1(torch.cat([x0_0, self.up(x1_0)], 1))
+
+        x2_0 = self.conv2_0(self.pool(x1_0))
+        x1_1 = self.conv1_1(torch.cat([x1_0, self.up(x2_0)], 1))
+        x0_2 = self.conv0_2(torch.cat([x0_0, x0_1, self.up(x1_1)], 1))
+
+        x3_0 = self.conv3_0(self.pool(x2_0))
+        x2_1 = self.conv2_1(torch.cat([x2_0, self.up(x3_0)], 1))
+        x1_2 = self.conv1_2(torch.cat([x1_0, x1_1, self.up(x2_1)], 1))
+        x0_3 = self.conv0_3(torch.cat([x0_0, x0_1, x0_2, self.up(x1_2)], 1))
+
+        x4_0 = self.conv4_0(self.pool(x3_0))
+        x3_1 = self.conv3_1(torch.cat([x3_0, self.up(x4_0)], 1))
+        x2_2 = self.conv2_2(torch.cat([x2_0, x2_1, self.up(x3_1)], 1))
+        x1_3 = self.conv1_3(torch.cat([x1_0, x1_1, x1_2, self.up(x2_2)], 1))
+        x0_4 = self.conv0_4(torch.cat([x0_0, x0_1, x0_2, x0_3, self.up(x1_3)], 1))
+
+        return self.final(x0_4)
+
+
+SEGMENTATION_ARCHITECTURES = {
+    "unet": UNet,
+    "unet_plus": UNetPlusPlus,
+    "attention_unet": AttentionUNet,
+}
+
+
+def get_monai_unet3d(in_channels: int = 1, out_channels: int = 3) -> nn.Module:
+    """Instantiate the 3D MONAI UNet architecture for BraTS WT/TC/ET segmentation."""
+    try:
+        from monai.networks.nets import UNet as MonaiUNet
+        return MonaiUNet(
+            spatial_dims=3,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            channels=(16, 32, 64, 128),
+            strides=(2, 2, 2),
+            num_res_units=2,
+        )
+    except Exception as e:
+        logger.error(f"Failed to import/instantiate MONAI UNet: {e}")
+        raise
+
+
+def get_segmentation_model(model_name: str, in_channels: int = 1, out_channels: int = 4) -> nn.Module:
+    """Factory to instantiate segmentation architectures."""
+    model_name = model_name.lower()
+    if model_name in ("monai_unet3d", "unet3d"):
+        return get_monai_unet3d(in_channels=in_channels, out_channels=3)
+    if model_name in SEGMENTATION_ARCHITECTURES:
+        return SEGMENTATION_ARCHITECTURES[model_name](in_channels=in_channels, out_channels=out_channels)
+    # Default fallback to UNet
+    return UNet(in_channels=in_channels, out_channels=out_channels)
+
+
+def load_tumor_segmentation_model(
+    architecture: str = "monai_unet3d",
+    weights_path: str | None = None,
+    device: str = "cpu",
+) -> tuple[nn.Module, str]:
+    """
+    Load segmentation model and its trained weights.
+    Returns (model, model_type) where model_type is 'monai3d' or '2d'.
+    """
+    from pathlib import Path
+    arch_norm = architecture.lower()
+
+    # Look for candidate weights
+    candidates = []
+    if weights_path:
+        candidates.append(Path(weights_path))
+
+    # Standard search paths
+    base_dirs = [Path("./weights"), Path("../weights"), Path("weights")]
+    if arch_norm in ("monai_unet3d", "unet3d", "unet"):
+        for b in base_dirs:
+            candidates.extend([
+                b / "BrainTumorSegmentationModel.pt",
+                b / "best_unet_wt_tc_et.pth",
+                b / "segmentation_unet_brats20.pth",
+            ])
+
+    # Check downloads fallback if needed
+    user_downloads = Path("C:/Users/Darshan/Downloads/BrainTumorSegmentationModel.pt")
+    if user_downloads.exists():
+        candidates.append(user_downloads)
+
+    for c in candidates:
+        if c.exists():
+            logger.info(f"Loading segmentation weights from {c}")
+            try:
+                # 1. Try TorchScript loading (e.g. BrainTumorSegmentationModel.pt)
+                try:
+                    ts_model = torch.jit.load(str(c), map_location=device)
+                    ts_model.eval()
+                    logger.info(f"Loaded TorchScript MONAI 3D model successfully from {c}")
+                    return ts_model, "monai3d"
+                except Exception:
+                    pass
+
+                # 2. Try PyTorch state_dict loading
+                sd = torch.load(str(c), map_location=device)
+                if isinstance(sd, dict) and "model_state_dict" in sd:
+                    state_dict = sd["model_state_dict"]
+                else:
+                    state_dict = sd
+
+                # Check if 3D MONAI or 2D
+                if any("model.0" in k or "conv.unit0" in k for k in state_dict.keys()):
+                    model = get_monai_unet3d(in_channels=1, out_channels=3).to(device)
+                    model.load_state_dict(state_dict)
+                    model.eval()
+                    logger.info(f"Loaded MONAI 3D state_dict from {c}")
+                    return model, "monai3d"
+                else:
+                    model = UNet(in_channels=1, out_channels=4).to(device)
+                    model.load_state_dict(state_dict)
+                    model.eval()
+                    logger.info(f"Loaded 2D UNet state_dict from {c}")
+                    return model, "2d"
+            except Exception as e:
+                logger.warning(f"Could not load weights from {c}: {e}")
+
+    # Fallback to initialized MONAI 3D model
+    logger.warning("No checkpoint found; creating new MONAI 3D model")
+    fallback = get_monai_unet3d(in_channels=1, out_channels=3).to(device)
+    fallback.eval()
+    return fallback, "monai3d"
+
+
+def predict_tumor_subregions(
+    volume: np.ndarray,
+    architecture: str = "monai_unet3d",
+    weights_path: str | None = None,
+    device: str | None = None,
+    header: Any = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    """
+    Predict WT, TC, and ET tumor sub-regions from input 3D MRI volume.
+
+    Returns:
+        wt_mask (bool np.ndarray): Whole Tumor mask (ED + NCR + ET)
+        tc_mask (bool np.ndarray): Tumor Core mask (NCR + ET)
+        et_mask (bool np.ndarray): Enhancing Tumor mask (ET)
+        combined_mask (uint8 np.ndarray): BraTS labeled mask (0=BG, 1=NCR, 2=ED, 4=ET)
+        measurements (dict): Voxel counts, physical volumes (cm3, mm3), spacing, validation info
+    """
+    import numpy as np
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    vol_f32 = volume.astype(np.float32)
+    orig_shape = vol_f32.shape
+
+    # 1. Parse physical voxel spacing from NIfTI header
+    if header is not None and hasattr(header, "get_zooms"):
+        zooms = header.get_zooms()[:3]
+        voxel_spacing = [float(zooms[0]), float(zooms[1]), float(zooms[2])]
+    else:
+        voxel_spacing = [1.0, 1.0, 1.0]
+
+    voxel_vol_mm3 = voxel_spacing[0] * voxel_spacing[1] * voxel_spacing[2]
+    voxel_vol_cm3 = voxel_vol_mm3 / 1000.0
+
+    # 2. Intensity normalization (MONAI ScaleIntensity: min-max scaling)
+    v_min, v_max = float(vol_f32.min()), float(vol_f32.max())
+    vol_norm = (vol_f32 - v_min) / (v_max - v_min + 1e-8)
+
+    # 3. Brain foreground mask
+    fg_thresh = vol_f32[vol_f32 > 0].mean() * 0.1 if np.any(vol_f32 > 0) else 0.0
+    brain_mask = vol_f32 > fg_thresh
+
+    # 4. Load model
+    model, model_type = load_tumor_segmentation_model(
+        architecture=architecture,
+        weights_path=weights_path,
+        device=device,
+    )
+
+    if model_type == "monai3d":
+        # 3D MONAI UNet: (1, 1, D, H, W)
+        x = torch.from_numpy(vol_norm).unsqueeze(0).unsqueeze(0).to(device)
+
+        # Pad spatial dimensions to nearest multiple of 8 if required by 3D UNet
+        pads = []
+        for d in reversed(orig_shape):
+            rem = d % 8
+            pad_len = (8 - rem) if rem != 0 else 0
+            pads.extend([0, pad_len])
+
+        if any(pads):
+            x_pad = F.pad(x, pads, mode="constant", value=0)
+        else:
+            x_pad = x
+
+        with torch.no_grad():
+            y_pad = model(x_pad)
+
+        # Unpad back to original shape: ensures 100% spatial alignment with raw MRI
+        y = y_pad[:, :, :orig_shape[0], :orig_shape[1], :orig_shape[2]]
+        probs = torch.sigmoid(y).squeeze(0).cpu().numpy()
+
+        # MONAI training output channel meanings (from notebook Stage 4):
+        # Ch 0: WT (Whole Tumor, logits)
+        # Ch 1: TC (Tumor Core, logits)
+        # Ch 2: ET (Enhancing Tumor, logits)
+        raw_wt = (probs[0] > 0.5) & brain_mask
+        raw_tc = (probs[1] > 0.5) & brain_mask
+        raw_et = (probs[2] > 0.5) & brain_mask
+
+    else:
+        # 2D model fallback: evaluate slice by slice
+        raw_wt = np.zeros(orig_shape, dtype=bool)
+        raw_tc = np.zeros(orig_shape, dtype=bool)
+        raw_et = np.zeros(orig_shape, dtype=bool)
+
+        for z in range(orig_shape[2]):
+            sl = vol_norm[:, :, z]
+            sl_t = torch.from_numpy(sl).unsqueeze(0).unsqueeze(0).to(device)
+            with torch.no_grad():
+                out_sl = model(sl_t)
+            pred_class = torch.argmax(out_sl, dim=1).squeeze(0).cpu().numpy()
+            raw_wt[:, :, z] = ((pred_class == 1) | (pred_class == 2) | (pred_class == 3)) & brain_mask[:, :, z]
+            raw_tc[:, :, z] = ((pred_class == 1) | (pred_class == 3)) & brain_mask[:, :, z]
+            raw_et[:, :, z] = (pred_class == 3) & brain_mask[:, :, z]
+
+    # 5. Strict Hierarchical Anatomical Nesting Enforcement:
+    # WT = Whole Tumor (the outer envelope)
+    # TC = Tumor Core (nested strictly within WT)
+    # ET = Enhancing Tumor (nested strictly within TC)
+    wt_mask = (raw_wt | raw_tc | raw_et).astype(bool)
+    tc_mask = ((raw_tc | raw_et) & wt_mask).astype(bool)
+    et_mask = (raw_et & tc_mask).astype(bool)
+
+    # 6. Combined BraTS label mapping
+    # 0 = Background
+    # 1 = Necrotic Core (TC \ ET)
+    # 2 = Peritumoral Edema (WT \ TC)
+    # 4 = Enhancing Tumor (ET)
+    combined_mask = np.zeros(orig_shape, dtype=np.uint8)
+    combined_mask[wt_mask] = 2
+    combined_mask[tc_mask] = 1
+    combined_mask[et_mask] = 4
+
+    # 7. Voxel counts & physical volume measurements
+    wt_voxels = int(wt_mask.sum())
+    tc_voxels = int(tc_mask.sum())
+    et_voxels = int(et_mask.sum())
+
+    raw_wt_voxels = int(raw_wt.sum())
+    raw_tc_voxels = int(raw_tc.sum())
+    raw_et_voxels = int(raw_et.sum())
+    raw_nesting_valid = bool((raw_et_voxels <= raw_tc_voxels) and (raw_tc_voxels <= raw_wt_voxels))
+
+    wt_vol_mm3 = round(float(wt_voxels * voxel_vol_mm3), 2)
+    wt_vol_cm3 = round(float(wt_voxels * voxel_vol_cm3), 2)
+
+    tc_vol_mm3 = round(float(tc_voxels * voxel_vol_mm3), 2)
+    tc_vol_cm3 = round(float(tc_voxels * voxel_vol_cm3), 2)
+
+    et_vol_mm3 = round(float(et_voxels * voxel_vol_mm3), 2)
+    et_vol_cm3 = round(float(et_voxels * voxel_vol_cm3), 2)
+
+    # 8. Validation of hierarchical nesting: ET <= TC <= WT
+    valid_nesting = bool((et_voxels <= tc_voxels) and (tc_voxels <= wt_voxels))
+    warning = None
+    if not valid_nesting or not raw_nesting_valid:
+        warning = "Anomalous sub-region volumes detected: hierarchical condition ET <= TC <= WT was violated."
+
+    # 9. Find peak tumor slice along z-axis
+    if wt_voxels > 0:
+        slice_sums = wt_mask.sum(axis=(0, 1))
+        best_slice_idx = int(np.argmax(slice_sums))
+    else:
+        best_slice_idx = int(orig_shape[2] // 2)
+
+    # 10. Formulate validated tumor presence assessment
+    from backend.utils.report_generator import BrainSightReportGenerator
+
+    has_valid_brain_tissue = bool(np.sum(brain_mask) > 5000)
+    measurements_dict = {
+        "wt": {
+            "name": "Whole Tumor (WT)",
+            "description": "Complete tumor region (Edema + Core + Enhancing)",
+            "color": "#22c55e",
+            "voxels": wt_voxels,
+            "volume_cm3": wt_vol_cm3,
+            "volume_mm3": wt_vol_mm3,
+        },
+        "tc": {
+            "name": "Tumor Core (TC)",
+            "description": "Tumor core region within WT (Necrotic + Enhancing)",
+            "color": "#eab308",
+            "voxels": tc_voxels,
+            "volume_cm3": tc_vol_cm3,
+            "volume_mm3": tc_vol_mm3,
+        },
+        "et": {
+            "name": "Enhancing Tumor (ET)",
+            "description": "Active enhancing tumor region within TC",
+            "color": "#ef4444",
+            "voxels": et_voxels,
+            "volume_cm3": et_vol_cm3,
+            "volume_mm3": et_vol_mm3,
+        },
+    }
+
+    validation_dict = {
+        "valid_nesting": valid_nesting,
+        "raw_nesting_valid": raw_nesting_valid,
+        "warning": warning,
+        "message": "ET <= TC <= WT verified successfully." if (valid_nesting and raw_nesting_valid) else warning,
+    }
+
+    tumor_status, status_explanation, val_status, tech_warnings = BrainSightReportGenerator.evaluate_tumor_status(
+        measurements=measurements_dict,
+        validation=validation_dict,
+        has_valid_brain_tissue=has_valid_brain_tissue,
+        raw_nesting_valid=raw_nesting_valid,
+    )
+
+    metadata = {
+        "voxel_spacing": voxel_spacing,
+        "voxel_volume_mm3": round(voxel_vol_mm3, 4),
+        "voxel_volume_cm3": round(voxel_vol_cm3, 6),
+        "shape": list(orig_shape),
+        "best_slice_idx": best_slice_idx,
+        "total_slices": orig_shape[2],
+        "tumor_status": tumor_status,
+        "assessment": {
+            "tumor_status": tumor_status,
+            "explanation": status_explanation,
+            "validation_status": val_status,
+            "technical_warnings": tech_warnings,
+        },
+        "measurements": measurements_dict,
+        "validation": validation_dict,
+    }
+
+    return wt_mask, tc_mask, et_mask, combined_mask, metadata
+

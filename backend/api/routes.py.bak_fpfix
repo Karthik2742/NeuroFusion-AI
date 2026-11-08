@@ -1,0 +1,822 @@
+"""
+NeuroFusion AI - API Routes
+All REST API endpoints for the medical imaging platform.
+"""
+
+from __future__ import annotations
+
+import os
+import uuid
+import shutil
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+from fastapi import APIRouter, File, HTTPException, UploadFile, Query
+from fastapi.responses import HTMLResponse, FileResponse, Response
+from loguru import logger
+
+from backend.api.schemas import (
+    AnalysisResponse,
+    AnalyzeRequest,
+    EnhanceRequest,
+    EnhanceResponse,
+    EnhancementModel,
+    EvaluateRequest,
+    EvaluateResponse,
+    FilterRequest,
+    GPUStatusResponse,
+    PreprocessRequest,
+    PreprocessResponse,
+    StatusResponse,
+    UploadResponse,
+)
+from backend.configs import config
+
+import json
+
+# Persistent file registry
+file_registry: dict[str, dict[str, Any]] = {}
+REGISTRY_FILE = Path(config.get("paths.temp_dir", "./temp")) / "file_registry.json"
+
+def save_registry():
+    try:
+        REGISTRY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        clean = {}
+        for fid, info in file_registry.items():
+            clean[fid] = {
+                "file_id": fid,
+                "filename": info.get("filename"),
+                "filepath": info.get("filepath"),
+                "file_size_mb": info.get("file_size_mb"),
+                "shape": info.get("shape"),
+                "modality": info.get("modality"),
+                "mri_type": info.get("mri_type"),
+            }
+            if "affine" in info:
+                clean[fid]["affine"] = info["affine"]
+        with open(REGISTRY_FILE, "w", encoding="utf-8") as f:
+            json.dump(clean, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Failed to save registry: {e}")
+
+def load_registry() -> dict[str, dict[str, Any]]:
+    global file_registry
+    try:
+        if REGISTRY_FILE.exists():
+            with open(REGISTRY_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                for fid, info in data.items():
+                    if Path(info.get("filepath", "")).exists():
+                        file_registry[fid] = info
+    except Exception as e:
+        logger.warning(f"Failed to load registry: {e}")
+    return file_registry
+
+def get_file_record(file_id: str) -> dict[str, Any] | None:
+    if file_id in file_registry and Path(file_registry[file_id].get("filepath", "")).exists():
+        return file_registry[file_id]
+    load_registry()
+    if file_id in file_registry and Path(file_registry[file_id].get("filepath", "")).exists():
+        return file_registry[file_id]
+    return None
+
+router = APIRouter()
+
+# ============ UPLOAD ============
+
+@router.post("/upload", response_model=UploadResponse, tags=["Upload"])
+async def upload_mri(file: UploadFile = File(...)):
+    """Upload a NIfTI MRI file (.nii or .nii.gz)."""
+    filename = file.filename or "unknown.nii.gz"
+    suffix = "".join(Path(filename).suffixes).lower()
+    allowed = config.get("upload.allowed_extensions", [".nii", ".nii.gz"])
+
+    if suffix not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file format: {suffix}. Allowed: {allowed}",
+        )
+
+    file_id = str(uuid.uuid4())[:8]
+    upload_dir = Path(config.get("paths.temp_dir", "./temp")) / file_id
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    filepath = upload_dir / filename
+
+    with open(filepath, "wb") as f:
+        content = await file.read()
+        f.write(content)
+
+    file_size_mb = round(os.path.getsize(filepath) / (1024 * 1024), 2)
+    logger.info(f"Uploaded: {filename} ({file_size_mb} MB) → {file_id}")
+
+    try:
+        from backend.utils.io import NIfTILoader
+        from backend.preprocessing.dataset_analyzer import DatasetAnalyzer
+        from backend.utils.visualization import generate_slice_views
+
+        loader = NIfTILoader()
+        data, header, affine = loader.load_nibabel(filepath)
+
+        analyzer = DatasetAnalyzer()
+        mri_type = analyzer._detect_mri_type(data, header)
+        modality = analyzer._detect_modality(data, filename)
+
+        preview = generate_slice_views(data, title=f"{filename}")
+
+        file_registry[file_id] = {
+            "filename": filename,
+            "filepath": str(filepath),
+            "file_size_mb": file_size_mb,
+            "shape": list(data.shape),
+            "modality": modality,
+            "mri_type": mri_type,
+            "affine": affine.tolist(),
+        }
+        save_registry()
+
+        return UploadResponse(
+            file_id=file_id,
+            filename=filename,
+            file_size_mb=file_size_mb,
+            shape=list(data.shape),
+            modality=modality,
+            mri_type=mri_type,
+            preview=preview,
+        )
+
+    except Exception as e:
+        logger.error(f"Upload processing failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
+
+
+# ============ ANALYZE ============
+
+@router.post("/analyze", response_model=AnalysisResponse, tags=["Analysis"])
+async def analyze_mri(request: AnalyzeRequest):
+    """Perform comprehensive analysis on an uploaded MRI file."""
+    file_info = get_file_record(request.file_id)
+    if not file_info:
+        raise HTTPException(status_code=404, detail=f"File not found: {request.file_id}")
+
+    try:
+        from backend.preprocessing.dataset_analyzer import DatasetAnalyzer
+
+        analyzer = DatasetAnalyzer()
+        result = analyzer.analyze_file(file_info["filepath"])
+
+        return AnalysisResponse(
+            file_id=request.file_id,
+            mri_type=result["mri_type"],
+            modality=result["modality"],
+            intensity_stats=result["intensity_stats"],
+            spatial_stats=result["spatial_stats"],
+            quality_metrics=result["quality_metrics"],
+            charts=result["charts"],
+        )
+
+    except Exception as e:
+        logger.error(f"Analysis failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/analyze/dataset", tags=["Analysis"])
+async def analyze_dataset(dataset_path: str = Query(..., description="Path to dataset directory")):
+    """Analyze an entire MRI dataset directory."""
+    from backend.preprocessing.dataset_analyzer import DatasetAnalyzer
+
+    if not Path(dataset_path).exists():
+        raise HTTPException(status_code=404, detail=f"Directory not found: {dataset_path}")
+
+    analyzer = DatasetAnalyzer()
+    return analyzer.analyze_dataset(dataset_path)
+
+
+# ============ PREPROCESS ============
+
+@router.post("/preprocess", response_model=PreprocessResponse, tags=["Preprocessing"])
+async def preprocess_mri(request: PreprocessRequest):
+    """Apply preprocessing pipeline to an MRI file."""
+    file_info = get_file_record(request.file_id)
+    if not file_info:
+        raise HTTPException(status_code=404, detail=f"File not found: {request.file_id}")
+
+    try:
+        from backend.preprocessing.preprocessor import MRIPreprocessor
+        from backend.utils.visualization import generate_slice_views
+
+        preprocessor = MRIPreprocessor()
+        output_dir = Path(config.get("paths.outputs_dir", "./outputs")) / "preprocessed"
+
+        result = preprocessor.run_pipeline(
+            filepath=file_info["filepath"],
+            steps=[s.value for s in request.steps],
+            output_dir=output_dir if request.save_output else None,
+        )
+
+        output_file_id = None
+        if "output_file" in result:
+            output_file_id = str(uuid.uuid4())[:8]
+            file_registry[output_file_id] = {
+                "filename": Path(result["output_file"]).name,
+                "filepath": result["output_file"],
+                "shape": result["output_shape"],
+                "modality": file_info["modality"],
+                "mri_type": file_info["mri_type"],
+            }
+            save_registry()
+
+        preview = generate_slice_views(result["data"], title="Preprocessed MRI")
+
+        return PreprocessResponse(
+            file_id=request.file_id,
+            output_file_id=output_file_id,
+            steps_applied=result["steps_applied"],
+            step_details=result["step_details"],
+            original_shape=result["original_shape"],
+            output_shape=result["output_shape"],
+            preview=preview,
+        )
+
+    except Exception as e:
+        logger.error(f"Preprocessing failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============ ENHANCE ============
+
+@router.post("/enhance", response_model=EnhanceResponse, tags=["Enhancement"])
+async def enhance_mri(request: EnhanceRequest):
+    """Apply AI-powered enhancement to an MRI file."""
+    file_info = get_file_record(request.file_id)
+    if not file_info:
+        raise HTTPException(status_code=404, detail=f"File not found: {request.file_id}")
+
+    try:
+        from backend.utils.io import NIfTILoader
+        from backend.models.enhancement import get_enhancement_model
+        from backend.evaluation.metrics import EnhancementMetrics
+        from backend.utils.visualization import generate_comparison_view, generate_slice_views
+
+        loader = NIfTILoader()
+        data, header, affine = loader.load_nibabel(file_info["filepath"])
+
+        model = get_enhancement_model(request.model.value)
+        enhanced, inference_meta = model.enhance_volume(data, batch_size=request.batch_size)
+
+        metrics = {}
+        if request.compute_metrics:
+            metrics = EnhancementMetrics.compute_all(data, enhanced)
+
+        output_dir = Path(config.get("paths.outputs_dir", "./outputs")) / "enhanced"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_filename = f"enhanced_{request.model.value}_{Path(file_info['filename']).stem}.nii.gz"
+        output_path = output_dir / output_filename
+        loader.save_nifti(enhanced, affine, output_path, header)
+
+        output_file_id = str(uuid.uuid4())[:8]
+        file_registry[output_file_id] = {
+            "filename": output_filename,
+            "filepath": str(output_path),
+            "shape": list(enhanced.shape),
+            "modality": file_info["modality"],
+            "mri_type": file_info["mri_type"],
+        }
+        save_registry()
+
+        comparison = generate_comparison_view(
+            data, enhanced, title=f"Enhancement: {request.model.value.upper()}"
+        )
+        preview = generate_slice_views(enhanced, title="Enhanced MRI")
+
+        return EnhanceResponse(
+            file_id=request.file_id,
+            model_used=request.model.value,
+            output_file_id=output_file_id,
+            metrics=metrics,
+            inference_time_sec=inference_meta["inference_time_sec"],
+            peak_memory_gb=inference_meta["peak_memory_gb"],
+            device=inference_meta["device"],
+            comparison_view=comparison,
+            preview=preview,
+        )
+
+    except Exception as e:
+        logger.error(f"Enhancement failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============ LOCALIZE ============
+
+@router.post("/localize", tags=["Disease Localization"])
+async def localize_disease(file_id: str = Query(...)):
+    """Automatically localize abnormal pathology regions and generate heatmaps."""
+    file_info = get_file_record(file_id)
+    if not file_info:
+        raise HTTPException(status_code=404, detail=f"File not found: {file_id}")
+
+    try:
+        from backend.utils.io import NIfTILoader
+        from backend.evaluation.explainability import DiseaseLocalizer
+
+        loader = NIfTILoader()
+        data, _, _ = loader.load_nibabel(file_info["filepath"])
+
+        mri_type = file_info.get("mri_type", "brain")
+        results = DiseaseLocalizer.localize_pathology(data, mri_type=mri_type)
+        heatmap = DiseaseLocalizer.generate_heatmap_visualization(data)
+
+        return {
+            "file_id": file_id,
+            "mri_type": mri_type,
+            "localization": results,
+            "heatmap_preview": heatmap,
+        }
+
+    except Exception as e:
+        logger.error(f"Localization failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============ SEGMENT ============
+
+# In-memory cache for fast slice scrubbing
+_SLICE_VOLUME_CACHE: dict[str, tuple[Any, float]] = {}
+
+def _get_cached_nifti_data(filepath: str):
+    import time
+    from backend.utils.io import NIfTILoader
+    now = time.time()
+    if filepath in _SLICE_VOLUME_CACHE:
+        data, _ = _SLICE_VOLUME_CACHE[filepath]
+        _SLICE_VOLUME_CACHE[filepath] = (data, now)
+        return data
+    loader = NIfTILoader()
+    data, _, _ = loader.load_nibabel(filepath)
+    # Evict if cache exceeds 10 volumes
+    if len(_SLICE_VOLUME_CACHE) > 10:
+        oldest_key = min(_SLICE_VOLUME_CACHE.keys(), key=lambda k: _SLICE_VOLUME_CACHE[k][1])
+        _SLICE_VOLUME_CACHE.pop(oldest_key, None)
+    _SLICE_VOLUME_CACHE[filepath] = (data, now)
+    return data
+
+
+@router.post("/segment", tags=["Segmentation"])
+async def segment_mri(
+    file_id: str = Query(...),
+    architecture: str = Query("monai_unet3d", description="monai_unet3d, unet, unet_plus, attention_unet"),
+):
+    """Run ROI segmentation using deep learning model with hierarchical WT/TC/ET sub-regions."""
+    file_info = get_file_record(file_id)
+    if not file_info:
+        raise HTTPException(status_code=404, detail=f"File not found: {file_id}")
+
+    try:
+        import numpy as np
+        from backend.utils.io import NIfTILoader
+        from backend.models.segmentation.segmenter import predict_tumor_subregions
+        from backend.utils.visualization import generate_segmentation_overlay
+
+        loader = NIfTILoader()
+        data, header, affine = loader.load_nibabel(file_info["filepath"])
+
+        # Predict genuine WT, TC, and ET sub-regions with hierarchical anatomical nesting
+        wt_mask, tc_mask, et_mask, combined_mask, metadata = predict_tumor_subregions(
+            volume=data,
+            architecture=architecture,
+            header=header,
+        )
+
+        # Save standard BraTS NIfTI mask: 0=BG, 1=NCR, 2=ED, 4=ET
+        output_dir = Path(config.get("paths.outputs_dir", "./outputs")) / "segmentations"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"mask_{architecture}_{Path(file_info['filename']).stem}.nii.gz"
+        loader.save_nifti(combined_mask.astype(np.float32), affine, output_path, header)
+
+        output_file_id = str(uuid.uuid4())[:8]
+        file_registry[output_file_id] = {
+            "filename": output_path.name,
+            "filepath": str(output_path),
+            "shape": list(combined_mask.shape),
+            "modality": "Segmentation Mask",
+            "mri_type": file_info.get("mri_type", "brain"),
+            "affine": affine.tolist() if hasattr(affine, "tolist") else affine,
+            "segmentation_metadata": metadata,
+            "parent_file_id": file_id,
+        }
+        file_registry[file_id]["last_segmentation"] = {
+            "mask_file_id": output_file_id,
+            "architecture": architecture,
+            "metadata": metadata,
+        }
+        save_registry()
+
+        # Generate initial multi-panel preview with embedded legend
+        overlay_preview = generate_segmentation_overlay(
+            volume=data,
+            mask=combined_mask,
+            slice_idx=metadata["best_slice_idx"],
+            title=f"Tumor Sub-regions — {architecture.upper()} (Slice {metadata['best_slice_idx'] + 1}/{metadata['total_slices']})",
+        )
+
+        return {
+            "file_id": file_id,
+            "architecture": architecture,
+            "mask_file_id": output_file_id,
+            "overlay_preview": overlay_preview,
+            "shape": list(data.shape),
+            "voxel_spacing": metadata["voxel_spacing"],
+            "best_slice_idx": metadata["best_slice_idx"],
+            "total_slices": metadata["total_slices"],
+            "measurements": metadata["measurements"],
+            "validation": metadata["validation"],
+            "assessment": metadata.get("assessment", {}),
+            "tumor_status": metadata.get("tumor_status", "INDETERMINATE — VALIDATION REQUIRED"),
+            "classes_detected": {
+                "Background": int(np.sum(combined_mask == 0)),
+                "Whole Tumor (WT)": metadata["measurements"]["wt"]["voxels"],
+                "Tumor Core (TC)": metadata["measurements"]["tc"]["voxels"],
+                "Enhancing Tumor (ET)": metadata["measurements"]["et"]["voxels"],
+            },
+        }
+
+    except Exception as e:
+        logger.error(f"Segmentation failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/segment/slice", tags=["Segmentation"])
+async def get_segmentation_slice(
+    file_id: str = Query(..., description="ID of the original MRI volume file"),
+    mask_file_id: str = Query(..., description="ID of the segmentation mask file"),
+    slice_idx: int = Query(..., ge=0, description="Slice index along specified plane"),
+    plane: str = Query("axial", description="axial, coronal, or sagittal"),
+    show_wt: bool = Query(True, description="Toggle WT (Green) overlay"),
+    show_tc: bool = Query(True, description="Toggle TC (Yellow) overlay"),
+    show_et: bool = Query(True, description="Toggle ET (Red) overlay"),
+    alpha: float = Query(0.45, ge=0.0, le=1.0, description="Overlay transparency"),
+):
+    """
+    Stream a 2D slice PNG with independent toggles for WT, TC, and ET.
+    If all overlays are toggled off, returns the pristine raw MRI slice.
+    """
+    orig_info = get_file_record(file_id)
+    mask_info = get_file_record(mask_file_id)
+
+    if not orig_info or not mask_info:
+        raise HTTPException(status_code=404, detail="Original MRI or Mask file not found")
+
+    try:
+        from backend.utils.visualization import render_slice_png_bytes
+
+        vol_data = _get_cached_nifti_data(orig_info["filepath"])
+        mask_data = _get_cached_nifti_data(mask_info["filepath"])
+
+        png_bytes = render_slice_png_bytes(
+            volume=vol_data,
+            mask=mask_data,
+            slice_idx=slice_idx,
+            plane=plane,
+            show_wt=show_wt,
+            show_tc=show_tc,
+            show_et=show_et,
+            alpha=alpha,
+        )
+
+        return Response(
+            content=png_bytes,
+            media_type="image/png",
+            headers={
+                "Cache-Control": "public, max-age=3600",
+            },
+        )
+    except Exception as e:
+        logger.error(f"Failed to generate slice view: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+# ============ EVALUATE ============
+
+@router.post("/evaluate", response_model=EvaluateResponse, tags=["Evaluation"])
+async def evaluate(request: EvaluateRequest):
+    """Compute evaluation metrics between original and enhanced MRI."""
+    orig_info = get_file_record(request.original_id)
+    enh_info = get_file_record(request.enhanced_id)
+    if not orig_info or not enh_info:
+        raise HTTPException(status_code=404, detail="One or both evaluation files not found")
+
+    try:
+        from backend.utils.io import NIfTILoader
+        from backend.evaluation.metrics import EnhancementMetrics
+        from backend.utils.visualization import generate_metrics_chart
+
+        loader = NIfTILoader()
+        orig_data, _, _ = loader.load_nibabel(orig_info["filepath"])
+        enh_data, _, _ = loader.load_nibabel(enh_info["filepath"])
+
+        metrics = EnhancementMetrics.compute_all(orig_data, enh_data)
+
+        charts = {
+            "metrics_chart": generate_metrics_chart(
+                metrics, title="Enhancement Quality Metrics"
+            )
+        }
+
+        return EvaluateResponse(
+            original_id=request.original_id,
+            enhanced_id=request.enhanced_id,
+            enhancement_metrics=metrics,
+            charts=charts,
+        )
+
+    except Exception as e:
+        logger.error(f"Evaluation failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============ REPORT ============
+
+def _assemble_report_payload(
+    file_id: str,
+    mask_file_id: str | None = None,
+    patient_id: str | None = None,
+    patient_name: str | None = None,
+    patient_age: str | None = None,
+) -> dict:
+    from backend.utils.report_generator import BrainSightReportGenerator
+
+    file_info = get_file_record(file_id)
+    if not file_info:
+        for fid, rec in file_registry.items():
+            if rec.get("filename") == file_id:
+                file_info = rec
+                file_id = fid
+                break
+
+    if not file_info:
+        raise HTTPException(status_code=404, detail=f"File not found: {file_id}")
+
+    # Determine mask_info
+    mask_info = None
+    if mask_file_id:
+        mask_info = get_file_record(mask_file_id)
+        if not mask_info:
+            for fid, rec in file_registry.items():
+                if rec.get("filename") == mask_file_id:
+                    mask_info = rec
+                    break
+
+    # If mask_file_id was not provided, look in file_info or file_registry
+    if not mask_info:
+        last_seg = file_info.get("last_segmentation")
+        if last_seg and "mask_file_id" in last_seg:
+            mask_info = get_file_record(last_seg["mask_file_id"])
+
+    if not mask_info:
+        stem = Path(file_info["filename"]).stem.replace(".nii", "")
+        for fid, rec in file_registry.items():
+            if rec.get("modality") == "Segmentation Mask" and (stem in rec.get("filename", "") or rec.get("parent_file_id") == file_id):
+                mask_info = rec
+                break
+
+    # Load 3D arrays
+    vol_data = _get_cached_nifti_data(file_info["filepath"])
+    mask_data = _get_cached_nifti_data(mask_info["filepath"]) if mask_info else None
+
+    # Get or reconstruct segmentation metadata
+    seg_metadata = None
+    if mask_info:
+        seg_metadata = mask_info.get("segmentation_metadata") or file_info.get("last_segmentation", {}).get("metadata")
+
+    if mask_data is not None and not seg_metadata:
+        from backend.utils.io import NIfTILoader
+        loader = NIfTILoader()
+        _, header, _ = loader.load_nibabel(file_info["filepath"])
+        voxel_spacing = [abs(float(header.get_zooms()[i])) for i in range(3)] if header else [1.0, 1.0, 1.0]
+        voxel_vol_mm3 = float(voxel_spacing[0] * voxel_spacing[1] * voxel_spacing[2])
+        voxel_vol_cm3 = float(voxel_vol_mm3 / 1000.0)
+
+        wt_mask = (mask_data == 1) | (mask_data == 2) | (mask_data == 4)
+        tc_mask = (mask_data == 1) | (mask_data == 4)
+        et_mask = (mask_data == 4)
+
+        wt_voxels = int(wt_mask.sum())
+        tc_voxels = int(tc_mask.sum())
+        et_voxels = int(et_mask.sum())
+
+        valid_nesting = bool((et_voxels <= tc_voxels) and (tc_voxels <= wt_voxels))
+        best_slice_idx = int(np.argmax(wt_mask.sum(axis=(0, 1)))) if wt_voxels > 0 else int(vol_data.shape[2] // 2)
+
+        seg_metadata = {
+            "voxel_spacing": voxel_spacing,
+            "best_slice_idx": best_slice_idx,
+            "measurements": {
+                "wt": {
+                    "name": "Whole Tumor (WT)",
+                    "description": "Complete tumor region (Edema + Core + Enhancing)",
+                    "color": "#22c55e",
+                    "voxels": wt_voxels,
+                    "volume_cm3": round(wt_voxels * voxel_vol_cm3, 2),
+                    "volume_mm3": round(wt_voxels * voxel_vol_mm3, 2),
+                },
+                "tc": {
+                    "name": "Tumor Core (TC)",
+                    "description": "Tumor core region within WT (Necrotic + Enhancing)",
+                    "color": "#eab308",
+                    "voxels": tc_voxels,
+                    "volume_cm3": round(tc_voxels * voxel_vol_cm3, 2),
+                    "volume_mm3": round(tc_voxels * voxel_vol_mm3, 2),
+                },
+                "et": {
+                    "name": "Enhancing Tumor (ET)",
+                    "description": "Active enhancing tumor region within TC",
+                    "color": "#ef4444",
+                    "voxels": et_voxels,
+                    "volume_cm3": round(et_voxels * voxel_vol_cm3, 2),
+                    "volume_mm3": round(et_voxels * voxel_vol_mm3, 2),
+                },
+            },
+            "validation": {
+                "valid_nesting": valid_nesting,
+                "warning": None if valid_nesting else "Anomalous sub-region volumes detected: ET <= TC <= WT violated.",
+            },
+        }
+
+    arch = file_info.get("last_segmentation", {}).get("architecture", "monai_unet3d")
+
+    report_data = BrainSightReportGenerator.assemble_report_data(
+        file_info=file_info,
+        mask_info=mask_info,
+        segmentation_metadata=seg_metadata,
+        volume_data=vol_data,
+        mask_data=mask_data,
+        patient_id=patient_id,
+        patient_name=patient_name,
+        patient_age=patient_age,
+        architecture=arch,
+    )
+    return report_data
+
+
+@router.get("/report/pdf", tags=["Reports"])
+async def download_report_pdf(
+    file_id: str = Query(..., description="ID or filename of the original MRI volume"),
+    mask_file_id: str | None = Query(None, description="Optional ID of the segmentation mask"),
+    patient_id: str | None = Query(None, description="Optional Patient ID"),
+    patient_name: str | None = Query(None, description="Optional Patient Name"),
+    patient_age: str | None = Query(None, description="Optional Patient Age"),
+):
+    """Generate and stream publication-grade A4 PDF segmentation report."""
+    try:
+        report_data = _assemble_report_payload(
+            file_id=file_id,
+            mask_file_id=mask_file_id,
+            patient_id=patient_id,
+            patient_name=patient_name,
+            patient_age=patient_age,
+        )
+        from backend.utils.report_generator import BrainSightReportGenerator
+        pdf_bytes = BrainSightReportGenerator.generate_pdf_report(report_data)
+        filename = f"BrainSight_AI_Report_{report_data['report_id']}.pdf"
+
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Cache-Control": "no-cache",
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to generate PDF report: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/report", tags=["Reports"])
+@router.post("/report", tags=["Reports"])
+async def generate_report(
+    file_id: str = Query(...),
+    mask_file_id: str | None = Query(None),
+    patient_id: str | None = Query(None),
+    patient_name: str | None = Query(None),
+    patient_age: str | None = Query(None),
+    print: bool = Query(False),
+):
+    """Generate complete, medical-style HTML technical and segmentation report."""
+    try:
+        report_data = _assemble_report_payload(
+            file_id=file_id,
+            mask_file_id=mask_file_id,
+            patient_id=patient_id,
+            patient_name=patient_name,
+            patient_age=patient_age,
+        )
+        from backend.utils.report_generator import BrainSightReportGenerator
+        html_content = BrainSightReportGenerator.generate_html_report(report_data, auto_print=print)
+        return HTMLResponse(content=html_content)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Report generation failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============ DOWNLOAD ============
+
+@router.get("/download/{file_id}", tags=["Download"])
+async def download_file(file_id: str):
+    """Download a processed MRI file."""
+    file_info = get_file_record(file_id)
+    if not file_info:
+        raise HTTPException(status_code=404, detail=f"File not found: {file_id}")
+
+    filepath = Path(file_info["filepath"])
+    if not filepath.exists():
+        raise HTTPException(status_code=404, detail="File no longer exists on disk")
+
+    return FileResponse(
+        path=str(filepath),
+        filename=file_info["filename"],
+        media_type="application/gzip",
+    )
+
+
+# ============ SYSTEM & INFO ============
+
+@router.get("/gpu", response_model=GPUStatusResponse, tags=["System"])
+async def gpu_status():
+    """Get current GPU status and memory usage."""
+    from backend.utils.gpu import get_gpu_stats
+
+    stats = get_gpu_stats()
+    return GPUStatusResponse(
+        is_available=stats.is_available,
+        device_name=stats.device_name,
+        total_memory_gb=stats.total_memory_gb,
+        allocated_memory_gb=stats.allocated_memory_gb,
+        free_memory_gb=stats.free_memory_gb,
+        utilization_percent=stats.utilization_percent,
+        cuda_version=stats.cuda_version,
+    )
+
+
+_ENHANCEMENT_MODELS_CACHE = [
+    {"name": "clahe", "display_name": "CLAHE (Baseline)", "parameters": {"total": 0, "trainable": 0}},
+    {"name": "restormer", "display_name": "Restormer (Efficient Transformer)", "parameters": {"total": 26100000, "trainable": 26100000}},
+    {"name": "swinir", "display_name": "SwinIR (Swin Transformer)", "parameters": {"total": 11800000, "trainable": 11800000}},
+    {"name": "mirnet", "display_name": "MIRNet (Dual Attention Units)", "parameters": {"total": 31700000, "trainable": 31700000}},
+]
+
+@router.get("/models/enhancement", tags=["Models"])
+async def list_enhancement_models():
+    """List available enhancement models."""
+    return {"models": _ENHANCEMENT_MODELS_CACHE}
+
+
+@router.get("/files", tags=["Files"])
+async def list_files():
+    """List all uploaded and processed files."""
+    load_registry()
+    files = []
+    for file_id, info in file_registry.items():
+        if Path(info.get("filepath", "")).exists():
+            files.append({
+                "file_id": file_id,
+                "filename": info.get("filename", "unknown"),
+                "shape": info.get("shape", []),
+                "modality": info.get("modality", "Unknown"),
+                "mri_type": info.get("mri_type", "unknown"),
+            })
+    return {"files": files}
+
+
+@router.get("/dataset/tree", tags=["Analysis"])
+async def get_dataset_tree():
+    """Get structured tree of dataset directory with Brain MRI categories."""
+    dataset_root = Path(config.get("paths.dataset_dir", "./dataset"))
+    structure = {
+        "brain": {"normal": [], "tumor": [], "stroke": []},
+    }
+    
+    for category in ["brain"]:
+        for subcat in structure[category].keys():
+            sub_path = dataset_root / category / subcat
+            if sub_path.exists():
+                for f in sub_path.glob("*.nii*"):
+                    structure[category][subcat].append({
+                        "name": f.name,
+                        "path": str(f),
+                        "size_mb": round(f.stat().st_size / (1024 * 1024), 2)
+                    })
+                    
+    return {
+        "dataset_root": str(dataset_root.resolve()),
+        "structure": structure,
+        "summary": {
+            "brain_total": sum(len(v) for v in structure["brain"].values()),
+        }
+    }
+

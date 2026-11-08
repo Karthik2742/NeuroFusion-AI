@@ -1,0 +1,89 @@
+# NeuroFusion AI - .gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+*.whl
+
+# Virtual environments
+venv/
+env/
+.env
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+
+# Node / Frontend
+node_modules/
+frontend/dist/
+frontend/build/
+.next/
+*.tsbuildinfo
+
+# Medical imaging data - never commit
+dataset/
+*.nii
+*.nii.gz
+*.dcm
+*.dicom
+*.mha
+*.mhd
+*.raw
+*.nrrd
+
+# Model weights
+weights/*.pth
+weights/*.pt
+weights/*.onnx
+weights/*.bin
+weights/*.h5
+*.ckpt
+
+# Outputs
+outputs/
+results/
+reports/*.pdf
+reports/*.pptx
+reports/*.csv
+logs/
+tensorboard_logs/
+runs/
+temp/
+scratch/
+NeuroFusion AI/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+*.lnk
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Docker
+docker/.env
+
+# Misc
+*.log
+*.tmp
+*.bak
+*.cache
+.pytest_cache/
+.coverage
+htmlcov/
